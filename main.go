@@ -470,8 +470,8 @@ func main() {
 	config.SourceDir = "."                 // 源目录，包含壁纸
 	config.TargetDir = "./dark_wallpapers" // 目标目录
 	config.DarkThreshold = 0.75            // 黑暗阈值
-	config.MinWidth = 1920
-	config.MinHeight = 1080
+	config.MinWidth = 1024
+	config.MinHeight = 728
 	config.CopyMode = false // false=移动，true=复制
 	config.Verbose = true
 
