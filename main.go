@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -465,41 +466,53 @@ func findAndMoveDarkWallpapers(config Config) ([]WallpaperInfo, error) {
 func main() {
 	// 配置
 	config := DefaultConfig()
-
-	// 可以在这里修改配置
-	config.SourceDir = "."                 // 源目录，包含壁纸
-	config.TargetDir = "./dark_wallpapers" // 目标目录
-	config.DarkThreshold = 0.75            // 黑暗阈值
-	config.MinWidth = 1024
-	config.MinHeight = 728
-	config.CopyMode = false // false=移动，true=复制
-	config.Verbose = true
-
-	fmt.Println("🖤 黑色壁纸查找与移动工具")
-	fmt.Println(strings.Repeat("=", 40))
-	fmt.Printf("源目录: %s\n", config.SourceDir)
-	fmt.Printf("目标目录: %s\n", config.TargetDir)
-	fmt.Printf("黑暗阈值: %.2f\n", config.DarkThreshold)
-	fmt.Printf("最小分辨率: %dx%d\n", config.MinWidth, config.MinHeight)
-	fmt.Printf("模式: %s\n", map[bool]string{true: "复制", false: "移动"}[config.CopyMode])
-	fmt.Println()
+	config.SourceDir = "."
 
 	// 检查源目录是否存在
 	if _, err := os.Stat(config.SourceDir); os.IsNotExist(err) {
 		log.Fatalf("源目录不存在: %s", config.SourceDir)
+		return
 	}
 
-	// 执行查找和移动
-	wallpapers, err := findAndMoveDarkWallpapers(config)
-	if err != nil {
-		log.Fatalf("处理失败: %v", err)
-	}
+	rootDir, _ := os.Getwd()
+	baseDirName := filepath.Base(rootDir)
 
-	// 显示结果
-	printSummary(wallpapers, config)
+	fmt.Println("🖤 黑色壁纸查找与移动工具")
+	fmt.Println(strings.Repeat("=", 40))
+	fmt.Println("整理完成的文件在上一级目录中，请勿整理磁盘根目录文件，若无疑问，程序将在 5s 后执行")
+	fmt.Println(strings.Repeat("=", 40))
+	time.Sleep(time.Second * 5)
 
-	// 保存结果到日志文件
-	if len(wallpapers) > 0 {
-		saveResultsToLog(wallpapers, config)
+	// 亮度依次递增
+	targetDarkThresholds := []int{95, 85, 75, 65, 55, 45, 35, 25, 15}
+	for _, threshold := range targetDarkThresholds {
+		// 源目录，包含壁纸
+		config.TargetDir = "../" + baseDirName + "_dark_wallpapers_" + strconv.Itoa(threshold) // 目标目录
+		config.DarkThreshold = float64(threshold) / 100.0                                      // 黑暗阈值
+		config.MinWidth = 1280
+		config.MinHeight = 720
+		config.CopyMode = false // false=移动，true=复制
+		config.Verbose = true
+
+		fmt.Printf("源目录: %s\n", config.SourceDir)
+		fmt.Printf("目标目录: %s\n", config.TargetDir)
+		fmt.Printf("黑暗阈值: %.2f\n", config.DarkThreshold)
+		fmt.Printf("最小分辨率: %dx%d\n", config.MinWidth, config.MinHeight)
+		fmt.Printf("模式: %s\n", map[bool]string{true: "复制", false: "移动"}[config.CopyMode])
+		fmt.Println()
+
+		// 执行查找和移动
+		wallpapers, err := findAndMoveDarkWallpapers(config)
+		if err != nil {
+			log.Fatalf("处理失败: %v", err)
+		}
+
+		// 显示结果
+		printSummary(wallpapers, config)
+
+		//// 保存结果到日志文件
+		//if len(wallpapers) > 0 {
+		//	saveResultsToLog(wallpapers, config)
+		//}
 	}
 }
