@@ -346,7 +346,7 @@ func analyzeImage(img image.Image) (darkScore float64, avgColor color.RGBA, widt
 	return darkScore, color.RGBA{avgR, avgG, avgB, 255}, width, height
 }
 
-// 查找并移动黑色壁纸
+// findAndMoveDarkWallpapers 查找并移动黑色壁纸（单次扫描版本）
 func findAndMoveDarkWallpapers(config Config) ([]WallpaperInfo, error) {
 	var darkWallpapers []WallpaperInfo
 	var mu sync.Mutex
@@ -483,36 +483,156 @@ func main() {
 	fmt.Println(strings.Repeat("=", 40))
 	time.Sleep(time.Second * 5)
 
-	// 亮度依次递增
-	targetDarkThresholds := []int{95, 85, 75, 65, 55, 45, 35, 25, 15}
+	// 定义多个黑暗阈值等级
+	targetDarkThresholds := []int{95, 85, 75, 65, 55}
+
+	// 第一步：一次性扫描所有图片，分析黑暗程度
+	fmt.Println("\n🔍 开始扫描图片...")
+	allWallpapers, err := scanAllImages(config)
+	if err != nil {
+		log.Fatalf("扫描失败: %v", err)
+	}
+
+	fmt.Printf("\n✅ 扫描完成！共找到 %d 张符合条件的图片\n", len(allWallpapers))
+
+	// 第二步：根据黑暗等级分类并移动到不同目录
 	for _, threshold := range targetDarkThresholds {
-		// 源目录，包含壁纸
-		config.TargetDir = "../" + baseDirName + "_dark_wallpapers_" + strconv.Itoa(threshold) // 目标目录
-		config.DarkThreshold = float64(threshold) / 100.0                                      // 黑暗阈值
-		config.MinWidth = 1280
-		config.MinHeight = 720
-		config.CopyMode = false // false=移动，true=复制
-		config.Verbose = true
+		darkThreshold := float64(threshold) / 100.0 // 转换为小数形式（如 0.95）
+		targetDir := "../" + baseDirName + "_dark_wallpapers_" + strconv.Itoa(threshold)
 
-		fmt.Printf("源目录: %s\n", config.SourceDir)
-		fmt.Printf("目标目录: %s\n", config.TargetDir)
-		fmt.Printf("黑暗阈值: %.2f\n", config.DarkThreshold)
-		fmt.Printf("最小分辨率: %dx%d\n", config.MinWidth, config.MinHeight)
-		fmt.Printf("模式: %s\n", map[bool]string{true: "复制", false: "移动"}[config.CopyMode])
-		fmt.Println()
+		fmt.Printf("\n" + strings.Repeat("=", 60) + "\n")
+		fmt.Printf("📁 处理黑暗等级 ≥ %d%% 的图片\n", threshold)
+		fmt.Printf("   目标目录: %s\n", targetDir)
+		fmt.Println(strings.Repeat("=", 60))
 
-		// 执行查找和移动
-		wallpapers, err := findAndMoveDarkWallpapers(config)
-		if err != nil {
-			log.Fatalf("处理失败: %v", err)
+		// 筛选出符合当前黑暗阈值的图片
+		filteredWallpapers := filterWallpapersByDarkness(allWallpapers, darkThreshold)
+
+		if len(filteredWallpapers) == 0 {
+			fmt.Printf("   ⚠️  没有符合黑暗等级 ≥ %d%% 的图片\n", threshold)
+			continue
 		}
 
-		// 显示结果
-		printSummary(wallpapers, config)
+		fmt.Printf("   找到 %d 张符合条件的图片\n", len(filteredWallpapers))
 
-		//// 保存结果到日志文件
-		//if len(wallpapers) > 0 {
-		//	saveResultsToLog(wallpapers, config)
-		//}
+		// 移动这些图片到对应目录
+		movedCount, err := moveWallpapersToTarget(filteredWallpapers, targetDir, config.CopyMode)
+		if err != nil {
+			log.Printf("⚠️  移动部分文件时出错: %v", err)
+		}
+
+		fmt.Printf("   ✓ 成功移动/复制 %d 张图片\n", movedCount)
 	}
+
+	fmt.Println("\n🎉 所有操作完成！")
+}
+
+// scanAllImages 一次性扫描所有图片并分析黑暗程度
+func scanAllImages(config Config) ([]WallpaperInfo, error) {
+	var allWallpapers []WallpaperInfo
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	// 创建worker池
+	jobs := make(chan string, 100)
+	results := make(chan *WallpaperInfo, 100)
+
+	// 启动worker
+	for i := 0; i < config.Parallel; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for path := range jobs {
+				if config.Verbose {
+					fmt.Printf("Worker %d 处理: %s\n", workerID, filepath.Base(path))
+				}
+
+				wp, err := processImageFile(path, config)
+				if err != nil {
+					// 静默跳过不符合条件的图片
+					continue
+				}
+
+				results <- wp
+			}
+		}(i)
+	}
+
+	// 收集结果
+	go func() {
+		for wp := range results {
+			mu.Lock()
+			allWallpapers = append(allWallpapers, *wp)
+			mu.Unlock()
+		}
+	}()
+
+	// 遍历源目录，发送任务
+	var processedCount int
+	err := filepath.WalkDir(config.SourceDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+
+		if d.IsDir() {
+			return nil
+		}
+
+		ext := strings.ToLower(filepath.Ext(path))
+		if supportedExts[ext] {
+			processedCount++
+			jobs <- path
+		}
+
+		return nil
+	})
+
+	close(jobs)
+	wg.Wait()
+	close(results)
+
+	// 按黑暗程度排序（从高到低）
+	sort.Slice(allWallpapers, func(i, j int) bool {
+		return allWallpapers[i].DarkScore > allWallpapers[j].DarkScore
+	})
+
+	fmt.Printf("   扫描文件总数: %d\n", processedCount)
+	fmt.Printf("   符合条件的图片: %d\n", len(allWallpapers))
+
+	return allWallpapers, err
+}
+
+// filterWallpapersByDarkness 根据黑暗阈值筛选图片
+func filterWallpapersByDarkness(wallpapers []WallpaperInfo, minDarkScore float64) []WallpaperInfo {
+	var filtered []WallpaperInfo
+	for _, wp := range wallpapers {
+		if wp.DarkScore >= minDarkScore {
+			filtered = append(filtered, wp)
+		}
+	}
+	return filtered
+}
+
+// moveWallpapersToTarget 将图片移动到指定目标目录
+func moveWallpapersToTarget(wallpapers []WallpaperInfo, targetDir string, copyMode bool) (int, error) {
+	movedCount := 0
+	var firstErr error
+
+	for _, wp := range wallpapers {
+		// 创建临时配置用于移动文件
+		tempConfig := Config{
+			TargetDir: targetDir,
+			CopyMode:  copyMode,
+		}
+
+		if err := moveOrCopyFile(&wp, tempConfig); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		movedCount++
+	}
+
+	return movedCount, firstErr
 }
