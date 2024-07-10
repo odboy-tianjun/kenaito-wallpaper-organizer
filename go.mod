@@ -1,4 +1,4 @@
-module kenaito-media-group-tool
+module kenaito-wallpaper-organizer
 
 go 1.21
 

@@ -1,3 +1,3 @@
-rm -f kenaito-dark-wallpaper-finder.exe
+rm -f kenaito-wallpaper-organizer.exe
 # build
-go build -o kenaito-dark-wallpaper-finder.exe main.go
+go build -o kenaito-wallpaper-organizer.exe main.go
