@@ -107,7 +107,7 @@ func main() {
 	fmt.Println("🖼️  Kenaito Wallpaper Organizer 壁纸整理工具")
 	fmt.Println(strings.Repeat("=", 50))
 	fmt.Printf("  源目录:     %s\n", config.SourceDir)
-	fmt.Printf("  目标目录:   %s（按黑暗等级分子目录）\n", config.TargetDir)
+	fmt.Printf("  目标目录:   %s\n", config.TargetDir)
 	fmt.Printf("  最小分辨率: %dx%d\n", config.MinWidth, config.MinHeight)
 	fmt.Printf("  文件大小:   %dKB ~ %dMB\n", config.MinSizeKB, config.MaxSizeMB)
 	fmt.Printf("  模式:       %s\n", map[bool]string{true: "复制", false: "移动"}[config.CopyMode])
