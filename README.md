@@ -42,7 +42,7 @@ cd ~/Pictures/wallpapers
 
 执行后,源目录下会生成如下结构:
 
-├── wallpapers_dark_wallpapers/
+├── wallpapers_wallpapers/
 │   ├── dark_95/
 │   │   ├── horizontal/  → 1K/ 2K/ 4K/ …
 │   │   ├── vertical/    → 1K/ 2K/ 4K/ …
@@ -59,7 +59,7 @@ cd ~/Pictures/wallpapers
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `-source` | string | `.` | 源目录路径，递归扫描该目录下所有图片 |
-| `-target` | string | 自动生成 | 目标目录基名，留空自动使用 `<源目录名>_dark_wallpapers` |
+| `-target` | string | 自动生成 | 目标目录基名，留空自动使用 `<源目录名>_wallpapers` |
 | `-min-width` | int | `1080` | 图片最小宽度（像素），低于此值进入 other |
 | `-min-height` | int | `720` | 图片最小高度（像素），低于此值进入 other |
 | `-min-size` | int | `100` | 最小文件大小（KB），小于此值进入 error |

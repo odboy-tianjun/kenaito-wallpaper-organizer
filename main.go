@@ -97,7 +97,7 @@ func main() {
 
 	// 如果目标目录为空，自动生成
 	if config.TargetDir == "" {
-		config.TargetDir = filepath.Join(absSource, baseDirName+"_dark_wallpapers")
+		config.TargetDir = filepath.Join(absSource, baseDirName+"_wallpapers")
 	} else {
 		if !filepath.IsAbs(config.TargetDir) {
 			config.TargetDir = filepath.Join(absSource, config.TargetDir)
