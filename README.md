@@ -5,11 +5,11 @@
 ## 功能特性
 
 - **智能明暗分析**:基于 ITU-R BT.601 亮度公式,同时统计暗色像素(亮度 < 80)与亮色像素(亮度 > 175)占比
-- **五级明暗分类**:暗色 `dark_95/85/75/65/55` 与亮色 `bright_95/85/75/65/55` 五档归档
+- **多级明暗分类**:暗色 `dark_100/95/85/75/65/55` 与亮色 `bright_85/75/65/55/45/35/25/15` 多档归档
 - **方向区分**:横屏 `horizontal` / 竖屏 `vertical` / 方形 `square` 子目录
 - **分辨率分档**:按长边区分 1K~8K 子目录
 - **特殊归置**:过小图(`fixed`)、分辨率不足(`other`)、异常文件(`error`)
-- **多格式支持**:JPG、PNG、GIF、BMP、WebP、TIFF
+- **多格式支持**:JPG/JPEG/JFIF/JPE、PNG/APNG、GIF、BMP/DIB、WebP、TIFF/TIF、PSD/PSB
 - **并发处理**:默认 24 线程并行分析,大图自动采样加速
 - **UUID 命名**:归档后的文件统一重命名为随机 UUID,不保留原文件名
 
@@ -43,12 +43,13 @@ cd ~/Pictures/wallpapers
 执行后,源目录下会生成如下结构:
 
 ├── wallpapers_wallpapers/
-│   ├── dark_95/
+│   ├── dark_100/
 │   │   ├── horizontal/  → 1K/ 2K/ 4K/ …
 │   │   ├── vertical/    → 1K/ 2K/ 4K/ …
 │   │   └── square/      → 1K/ …
-│   ├── bright_95/          # 与 dark_ 同构
-│   ├── neutral/             # 明暗皆不达标但尺寸合格
+│   ├── bright_85/          # 与 dark_ 同构（15~85）
+│   ├── psd/                 # PSD/PSB，不做明暗分类
+│   ├── gif/                 # GIF，不做明暗分类
 │   ├── fixed/               # 长边 < 1080 的过小图
 │   ├── other/               # 尺寸不足 min-width/min-height
 │   └── error/               # 大小超限或解码失败的异常文件
@@ -90,14 +91,12 @@ cd ~/Pictures/wallpapers
 
 ## 分类优先级
 
-1. **fixed**：长边 < 1080 的过小图片
-2. **other**：尺寸达标(≥1080)但低于 `min-width/min-height` 阈值的图片
-3. **dark_N**(从高到低,每张只归入最高档)
-4. **bright_N**(同理,处理完 dark 后剩余图中再判亮色档)
-5. **neutral**：上面均未命中的图片
-6. **error**：文件大小超限或解码失败的异常文件
+1. **psd/gif**：PSD/PSB 归 `psd/`，GIF 归 `gif/`，均不做明暗分类
+2. **fixed**：长边 < 1080 的过小图片
+3. **other**：尺寸达标(≥1080)但低于 `min-width/min-height` 阈值的图片
+4. **dark_N / bright_N**：达标图按主导分判定亮暗——`lightScore > darkScore` 归明亮、否则归暗色，每张图必归亮暗之一（无 neutral）
 
-所有正常分类(dark/bright/neutral/other)内部均按 方向 → 分辨率 分子目录。
+所有正常分类(dark/bright/other)内部均按 方向 → 分辨率 分子目录。
 
 ## 明暗评分算法
 
@@ -112,7 +111,8 @@ lightScore = 亮度 > 175 的像素占比
 - 默认使用**移动**模式,原文件会从源目录移走,首次使用建议加 `-copy` 试运行
 - 目标目录会被自动跳过,不会重复处理之前已整理的文件
 - UUID 命名,极端情况下重名会自动追加 `_(1)`、`_(2)` 等序号
-- 支持的图片格式依赖 Go 标准库 + `golang.org/x/image`:JPG、PNG、GIF、BMP、WebP、TIFF
+- 支持的图片格式依赖 Go 标准库 + `golang.org/x/image` + `github.com/oov/psd`：JPG/JPEG/JFIF/JPE、PNG/APNG、GIF、BMP/DIB、WebP、TIFF/TIF、PSD/PSB
+- 无后缀名的图片会通过文件头（magic 字节）探测自动识别，不会被静默跳过
 
 ## License
 

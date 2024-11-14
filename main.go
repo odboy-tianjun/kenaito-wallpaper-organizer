@@ -22,13 +22,17 @@ import (
 	_ "golang.org/x/image/bmp"
 	_ "golang.org/x/image/tiff"
 	_ "golang.org/x/image/webp"
+
+	_ "github.com/oov/psd"
 )
 
 // supportedExts 支持的图片格式
 var supportedExts = map[string]bool{
-	".jpg": true, ".jpeg": true, ".png": true,
-	".bmp": true, ".webp": true, ".gif": true,
+	".jpg": true, ".jpeg": true, ".jfif": true, ".jpe": true,
+	".png": true, ".apng": true,
+	".bmp": true, ".dib": true, ".webp": true, ".gif": true,
 	".tiff": true, ".tif": true,
+	".psd": true, ".psb": true,
 }
 
 // WallpaperInfo 存储壁纸信息
@@ -40,6 +44,7 @@ type WallpaperInfo struct {
 	Size       int64
 	Width      int
 	Height     int
+	Ext        string // 检测到的扩展名（无后缀图片用）
 }
 
 // Config 配置结构
@@ -62,7 +67,7 @@ func DefaultConfig() Config {
 		SourceDir:    ".",
 		MinWidth:     1080,
 		MinHeight:    720,
-		MinSizeKB:    100,
+		MinSizeKB:    50,
 		MaxSizeMB:    100,
 		CopyMode:     false,
 		Parallel:     24,
@@ -119,7 +124,9 @@ func main() {
 	}
 
 	// 黑暗阈值等级（从高到低）
-	thresholds := []int{95, 85, 75, 65, 55}
+	darkThresholds := []int{100, 95, 85, 75, 65, 55}
+	// 亮色阈值等级（从高到低，15~85）
+	brightThresholds := []int{85, 75, 65, 55, 45, 35, 25, 15}
 
 	// 第一步：一次性扫描所有图片并分析
 	fmt.Println("\n🔍 开始扫描图片...")
@@ -142,6 +149,15 @@ func main() {
 	conforming := make([]*WallpaperInfo, 0, len(allWallpapers))
 	for i := range allWallpapers {
 		wp := &allWallpapers[i]
+		// 0.5 PSD/GIF 文件单独归置，不按明暗分类
+		if isPSDOrGIF(wp.Path) {
+			dir := filepath.Join(config.TargetDir, psdGifDirName(wp.Path))
+			fmt.Printf("[%s] %s → %s/\n", psdGifDirName(wp.Path), filepath.Base(wp.Path), psdGifDirName(wp.Path))
+			if err := moveOrCopyFile(wp, dir, "", "", config.CopyMode); err != nil {
+				log.Printf("⚠️  处理 %s 失败 %s: %v", psdGifDirName(wp.Path), wp.Path, err)
+			}
+			continue
+		}
 		// 过小图片单独归置，不按明暗/分辨率细分
 		longEdge := wp.Width
 		if wp.Height > longEdge {
@@ -166,62 +182,51 @@ func main() {
 		conforming = append(conforming, wp)
 	}
 
-	// 第二步：暗色图片 → dark_N（从高到低，每张只归入最高档）
-	for _, threshold := range thresholds {
-		minScore := float64(threshold) / 100.0
-		targetDir := filepath.Join(config.TargetDir, fmt.Sprintf("dark_%d", threshold))
-		fmt.Printf("\n📁 处理暗色等级 ≥ %d%% 的图片\n", threshold)
-		moved := 0
-		remaining := conforming[:0]
-		for _, wp := range conforming {
-			if wp.DarkScore >= minScore {
-				if err := moveOrCopyFile(wp, targetDir, directionName(wp.Width, wp.Height), resolutionTierName(wp.Width, wp.Height), config.CopyMode); err != nil {
-					log.Printf("⚠️  移动失败 %s: %v", wp.Path, err)
-				} else {
-					moved++
-				}
-			} else {
-				remaining = append(remaining, wp)
-			}
-		}
-		fmt.Printf("   ✅ 暗色 ≥ %d%%：移动 %d 张\n", threshold, moved)
-		conforming = remaining
-	}
-
-	// 第三步：亮色图片 → bright_N（从高到低）
-	for _, threshold := range thresholds {
-		minScore := float64(threshold) / 100.0
-		targetDir := filepath.Join(config.TargetDir, fmt.Sprintf("bright_%d", threshold))
-		fmt.Printf("\n📁 处理亮色等级 ≥ %d%% 的图片\n", threshold)
-		moved := 0
-		remaining := conforming[:0]
-		for _, wp := range conforming {
-			if wp.LightScore >= minScore {
-				if err := moveOrCopyFile(wp, targetDir, directionName(wp.Width, wp.Height), resolutionTierName(wp.Width, wp.Height), config.CopyMode); err != nil {
-					log.Printf("⚠️  移动失败 %s: %v", wp.Path, err)
-				} else {
-					moved++
-				}
-			} else {
-				remaining = append(remaining, wp)
-			}
-		}
-		fmt.Printf("   ✅ 亮色 ≥ %d%%：移动 %d 张\n", threshold, moved)
-		conforming = remaining
-	}
-
-	// 第四步：剩余为中性图片 → neutral
-	moved := 0
-	neutralDir := filepath.Join(config.TargetDir, "neutral")
+	// 第二步：按"主导分"判定亮/暗（不走多层筛选），每张图必归亮或暗之一
+	darkSeconds, brightSeconds := 0, 0
+	darkLowest := darkThresholds[len(darkThresholds)-1]
+	brightLowest := brightThresholds[len(brightThresholds)-1]
 	for _, wp := range conforming {
-		if err := moveOrCopyFile(wp, neutralDir, directionName(wp.Width, wp.Height), resolutionTierName(wp.Width, wp.Height), config.CopyMode); err != nil {
-			log.Printf("⚠️  移动失败 %s: %v", wp.Path, err)
+		direction := directionName(wp.Width, wp.Height)
+		tier := resolutionTierName(wp.Width, wp.Height)
+
+		if wp.LightScore > wp.DarkScore {
+			// 亮色主导：取 lightScore 命中的最高一档，不足最低档则归最低档
+			picked := brightLowest
+			for _, t := range brightThresholds {
+				if wp.LightScore >= float64(t)/100.0 {
+					picked = t
+					break
+				}
+			}
+			targetDir := filepath.Join(config.TargetDir, fmt.Sprintf("bright_%d", picked))
+			if err := moveOrCopyFile(wp, targetDir, direction, tier, config.CopyMode); err != nil {
+				log.Printf("⚠️  移动失败 %s: %v", wp.Path, err)
+			} else {
+				brightSeconds++
+			}
 		} else {
-			moved++
+			// 暗色主导（含两者皆 0 的中间灰）→ 命中最高 dark 档，不足归最低档
+			picked := darkLowest
+			for _, t := range darkThresholds {
+				if wp.DarkScore >= float64(t)/100.0 {
+					picked = t
+					break
+				}
+			}
+			targetDir := filepath.Join(config.TargetDir, fmt.Sprintf("dark_%d", picked))
+			if err := moveOrCopyFile(wp, targetDir, direction, tier, config.CopyMode); err != nil {
+				log.Printf("⚠️  移动失败 %s: %v", wp.Path, err)
+			} else {
+				darkSeconds++
+			}
 		}
 	}
-	if moved > 0 {
-		fmt.Printf("\n📁 处理中性色图片 → neutral/：移动 %d 张\n", moved)
+	if brightSeconds > 0 {
+		fmt.Printf("\n📁 亮色主导 → bright_N：移动 %d 张\n", brightSeconds)
+	}
+	if darkSeconds > 0 {
+		fmt.Printf("\n📁 暗色主导 → dark_N：移动 %d 张\n", darkSeconds)
 	}
 
 	fmt.Printf("\n🎉 所有操作完成！文件已整理到: %s/\n", config.TargetDir)
@@ -298,7 +303,7 @@ func analyzeImageFile(path string, config Config) (*WallpaperInfo, error) {
 	}
 	defer file.Close()
 
-	img, _, err := image.Decode(file)
+	img, imageName, err := image.Decode(file)
 	if err != nil {
 		return nil, &DecodeError{Path: path, Reason: err.Error()}
 	}
@@ -313,6 +318,7 @@ func analyzeImageFile(path string, config Config) (*WallpaperInfo, error) {
 		Size:       fileInfo.Size(),
 		Width:      width,
 		Height:     height,
+		Ext:        detectExtension(path, imageName),
 	}, nil
 }
 
@@ -437,7 +443,8 @@ func scanAllImages(config Config) ([]WallpaperInfo, error) {
 			return nil
 		}
 		ext := strings.ToLower(filepath.Ext(path))
-		if supportedExts[ext] {
+		// 支持的后缀直接处理；无后缀文件按文件内容探测是否为图片（避免静默跳过）
+		if supportedExts[ext] || (ext == "" && isImageByContent(path)) {
 			processedCount++
 			jobs <- path
 		}
@@ -507,6 +514,57 @@ func newUUID() string {
 	return string(buf)
 }
 
+// isPSDOrGIF 判断扩展名是否为 PSD/PSB/GIF（单独归置，不参与明暗分类）
+func isPSDOrGIF(path string) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".psd", ".psb", ".gif":
+		return true
+	}
+	return false
+}
+
+// psdGifDirName 返回 PSD/GIF 对应的独立目录名（gif 用 gif，PSD/PSB 用 psd）
+func psdGifDirName(path string) string {
+	if strings.ToLower(filepath.Ext(path)) == ".gif" {
+		return "gif"
+	}
+	return "psd"
+}
+
+// formatExtensions 格式名到扩展名的映射（image.Image.Decode 返回的格式名）
+var formatExtensions = map[string]string{
+	"png":  ".png",
+	"jpeg": ".jpg",
+	"gif":  ".gif",
+	"bmp":  ".bmp",
+	"tiff": ".tiff",
+	"webp": ".webp",
+	"psd":  ".psd",
+	"psb":  ".psb",
+}
+
+// detectExtension 决定归档用扩展名：优先保留原后缀（如 .jfif），无后缀时按解码出的格式名补一个
+func detectExtension(path, imageName string) string {
+	if ext := strings.ToLower(filepath.Ext(path)); ext != "" {
+		return ext
+	}
+	if ext, ok := formatExtensions[imageName]; ok {
+		return ext
+	}
+	return ""
+}
+
+// isImageByContent 通过读取文件头（magic 字节）判断是否为已注册的图片格式，用于无后缀文件
+func isImageByContent(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	_, _, err = image.DecodeConfig(f)
+	return err == nil
+}
+
 // directionName 返回图像的横竖方向（宽==高为 square，宽>高为 horizontal，否则 vertical）
 func directionName(width, height int) string {
 	if width == height {
@@ -531,7 +589,10 @@ func moveOrCopyFile(wp *WallpaperInfo, targetDir, direction, tier string, copyMo
 		return err
 	}
 
-	ext := filepath.Ext(wp.Path)
+	ext := wp.Ext
+	if ext == "" {
+		ext = filepath.Ext(wp.Path)
+	}
 	newFilename := newUUID() + ext
 	dstPath := filepath.Join(dir, newFilename)
 
