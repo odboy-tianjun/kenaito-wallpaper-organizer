@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/rand"
 	"flag"
 	"fmt"
 	"image"
@@ -21,23 +22,29 @@ import (
 	_ "golang.org/x/image/bmp"
 	_ "golang.org/x/image/tiff"
 	_ "golang.org/x/image/webp"
+
+	_ "github.com/oov/psd"
 )
 
 // supportedExts 支持的图片格式
 var supportedExts = map[string]bool{
-	".jpg": true, ".jpeg": true, ".png": true,
-	".bmp": true, ".webp": true, ".gif": true,
+	".jpg": true, ".jpeg": true, ".jfif": true, ".jpe": true,
+	".png": true, ".apng": true,
+	".bmp": true, ".dib": true, ".webp": true, ".gif": true,
 	".tiff": true, ".tif": true,
+	".psd": true, ".psb": true,
 }
 
 // WallpaperInfo 存储壁纸信息
 type WallpaperInfo struct {
-	Path      string
-	DarkScore float64 // 黑暗程度评分（0-1，越高越暗）
-	AvgColor  color.RGBA
-	Size      int64
-	Width     int
-	Height    int
+	Path       string
+	DarkScore  float64 // 黑暗程度评分（0-1，越低越暗）
+	LightScore float64 // 亮度程度评分（0-1，越高越亮）
+	AvgColor   color.RGBA
+	Size       int64
+	Width      int
+	Height     int
+	Ext        string // 检测到的扩展名（无后缀图片用）
 }
 
 // Config 配置结构
@@ -58,9 +65,9 @@ type Config struct {
 func DefaultConfig() Config {
 	return Config{
 		SourceDir:    ".",
-		MinWidth:     1920,
-		MinHeight:    1080,
-		MinSizeKB:    100,
+		MinWidth:     1080,
+		MinHeight:    720,
+		MinSizeKB:    50,
 		MaxSizeMB:    100,
 		CopyMode:     false,
 		Parallel:     24,
@@ -95,17 +102,17 @@ func main() {
 
 	// 如果目标目录为空，自动生成
 	if config.TargetDir == "" {
-		config.TargetDir = filepath.Join(absSource, baseDirName+"_dark_wallpapers")
+		config.TargetDir = filepath.Join(absSource, baseDirName+"_wallpapers")
 	} else {
 		if !filepath.IsAbs(config.TargetDir) {
 			config.TargetDir = filepath.Join(absSource, config.TargetDir)
 		}
 	}
 
-	fmt.Println("🖤 黑色壁纸查找与移动工具")
+	fmt.Println("🖼️  Kenaito Wallpaper Organizer 壁纸整理工具")
 	fmt.Println(strings.Repeat("=", 50))
 	fmt.Printf("  源目录:     %s\n", config.SourceDir)
-	fmt.Printf("  目标目录:   %s（按黑暗等级分子目录）\n", config.TargetDir)
+	fmt.Printf("  目标目录:   %s\n", config.TargetDir)
 	fmt.Printf("  最小分辨率: %dx%d\n", config.MinWidth, config.MinHeight)
 	fmt.Printf("  文件大小:   %dKB ~ %dMB\n", config.MinSizeKB, config.MaxSizeMB)
 	fmt.Printf("  模式:       %s\n", map[bool]string{true: "复制", false: "移动"}[config.CopyMode])
@@ -117,7 +124,9 @@ func main() {
 	}
 
 	// 黑暗阈值等级（从高到低）
-	thresholds := []int{95, 85, 75, 65, 55}
+	darkThresholds := []int{100, 95, 85, 75, 65, 55}
+	// 亮色阈值等级（从高到低，15~85）
+	brightThresholds := []int{85, 75, 65, 55, 45, 35, 25, 15}
 
 	// 第一步：一次性扫描所有图片并分析
 	fmt.Println("\n🔍 开始扫描图片...")
@@ -126,57 +135,153 @@ func main() {
 		log.Fatalf("扫描失败: %v", err)
 	}
 
-	fmt.Printf("\n✅ 扫描完成！共 %d 张图片满足分辨率和大小要求\n", len(allWallpapers))
+	fmt.Printf("\n✅ 扫描完成！共发现 %d 张图片（分辨率/大小不达标者将放入 other）\n", len(allWallpapers))
 
 	if len(allWallpapers) == 0 {
 		fmt.Println("❌ 未找到符合条件的图片")
 		return
 	}
 
-	// 第二步：按黑暗等级分类并移动到不同子目录（从高到低，每张图片只归入一个等级）
-	for _, threshold := range thresholds {
-		minScore := float64(threshold) / 100.0
-		targetDir := filepath.Join(config.TargetDir, fmt.Sprintf("dark_%d", threshold))
+	// 第二步：分类并移动/复制，每张图片只归入一个目录
+	// 优先级：分辨率不达标→ other；达标者按 暗色 → 亮色 → 中性
 
-		fmt.Printf("\n%s\n", strings.Repeat("=", 60))
-		fmt.Printf("📁 处理黑暗等级 ≥ %d%% 的图片\n", threshold)
-		fmt.Printf("   目标目录: %s\n", targetDir)
-		fmt.Println(strings.Repeat("=", 60))
-
-		filtered := filterByDarkness(allWallpapers, minScore)
-
-		if len(filtered) == 0 {
-			fmt.Printf("   ⚠️  没有符合黑暗等级 ≥ %d%% 的图片\n", threshold)
+	// 2.0 过小图片(长边<1080)放入独立的 fixed 目录；其余分辨率不达标的放入 other
+	conforming := make([]*WallpaperInfo, 0, len(allWallpapers))
+	for i := range allWallpapers {
+		wp := &allWallpapers[i]
+		// 0.5 PSD/GIF 文件单独归置，不按明暗分类
+		if isPSDOrGIF(wp.Path) {
+			dir := filepath.Join(config.TargetDir, psdGifDirName(wp.Path))
+			fmt.Printf("[%s] %s → %s/\n", psdGifDirName(wp.Path), filepath.Base(wp.Path), psdGifDirName(wp.Path))
+			if err := moveOrCopyFile(wp, dir, "", "", config.CopyMode); err != nil {
+				log.Printf("⚠️  处理 %s 失败 %s: %v", psdGifDirName(wp.Path), wp.Path, err)
+			}
 			continue
 		}
-
-		fmt.Printf("   找到 %d 张符合条件的图片\n", len(filtered))
-
-		movedCount, moveErr := moveWallpapers(filtered, targetDir, config.CopyMode)
-		if moveErr != nil {
-			log.Printf("⚠️  移动部分文件时出错: %v", moveErr)
+		// 过小图片单独归置，不按明暗/分辨率细分
+		longEdge := wp.Width
+		if wp.Height > longEdge {
+			longEdge = wp.Height
 		}
-
-		fmt.Printf("   ✓ 成功移动/复制 %d 张图片\n", movedCount)
-
-		// 从待处理列表中移除本轮已处理的图片，避免后续低阈值重复处理
-		processed := make(map[string]struct{}, len(filtered))
-		for _, wp := range filtered {
-			processed[wp.Path] = struct{}{}
+		if longEdge < 1080 {
+			fixedDir := filepath.Join(config.TargetDir, "fixed")
+			fmt.Printf("[fixed] 长边 %d 过小 → fixed/\n", longEdge)
+			if err := moveOrCopyFile(wp, fixedDir, "", "", config.CopyMode); err != nil {
+				log.Printf("⚠️  处理 fixed 失败 %s: %v", wp.Path, err)
+			}
+			continue
 		}
-		remaining := make([]WallpaperInfo, 0, len(allWallpapers))
-		for _, wp := range allWallpapers {
-			if _, ok := processed[wp.Path]; !ok {
-				remaining = append(remaining, wp)
+		if wp.Width < config.MinWidth || wp.Height < config.MinHeight {
+			otherDir := filepath.Join(config.TargetDir, "other")
+			fmt.Printf("[other] 分辨率不足 %dx%d  → other/\n", wp.Width, wp.Height)
+			if err := moveOrCopyFile(wp, otherDir, directionName(wp.Width, wp.Height), resolutionTierName(wp.Width, wp.Height), config.CopyMode); err != nil {
+				log.Printf("⚠️  处理 other 失败 %s: %v", wp.Path, err)
+			}
+			continue
+		}
+		conforming = append(conforming, wp)
+	}
+
+	// 第二步：按"主导分"判定亮/暗（不走多层筛选），每张图必归亮或暗之一
+	darkSeconds, brightSeconds := 0, 0
+	darkLowest := darkThresholds[len(darkThresholds)-1]
+	brightLowest := brightThresholds[len(brightThresholds)-1]
+	for _, wp := range conforming {
+		direction := directionName(wp.Width, wp.Height)
+		tier := resolutionTierName(wp.Width, wp.Height)
+
+		if wp.LightScore > wp.DarkScore {
+			// 亮色主导：取 lightScore 命中的最高一档，不足最低档则归最低档
+			picked := brightLowest
+			for _, t := range brightThresholds {
+				if wp.LightScore >= float64(t)/100.0 {
+					picked = t
+					break
+				}
+			}
+			targetDir := filepath.Join(config.TargetDir, fmt.Sprintf("bright_%d", picked))
+			if err := moveOrCopyFile(wp, targetDir, direction, tier, config.CopyMode); err != nil {
+				log.Printf("⚠️  移动失败 %s: %v", wp.Path, err)
+			} else {
+				brightSeconds++
+			}
+		} else {
+			// 暗色主导（含两者皆 0 的中间灰）→ 命中最高 dark 档，不足归最低档
+			picked := darkLowest
+			for _, t := range darkThresholds {
+				if wp.DarkScore >= float64(t)/100.0 {
+					picked = t
+					break
+				}
+			}
+			targetDir := filepath.Join(config.TargetDir, fmt.Sprintf("dark_%d", picked))
+			if err := moveOrCopyFile(wp, targetDir, direction, tier, config.CopyMode); err != nil {
+				log.Printf("⚠️  移动失败 %s: %v", wp.Path, err)
+			} else {
+				darkSeconds++
 			}
 		}
-		allWallpapers = remaining
+	}
+	if brightSeconds > 0 {
+		fmt.Printf("\n📁 亮色主导 → bright_N：移动 %d 张\n", brightSeconds)
+	}
+	if darkSeconds > 0 {
+		fmt.Printf("\n📁 暗色主导 → dark_N：移动 %d 张\n", darkSeconds)
 	}
 
 	fmt.Printf("\n🎉 所有操作完成！文件已整理到: %s/\n", config.TargetDir)
 }
 
-// analyzeImageFile 分析单个图片的黑暗程度（不做阈值过滤）
+// SizeFilterError 表示文件大小不达标（min-size / max-size）
+type SizeFilterError struct {
+	Path   string
+	Reason string
+}
+
+func (e *SizeFilterError) Error() string { return e.Reason }
+
+// DecodeError 表示文件无法打开或解码（损坏/非图片）
+type DecodeError struct {
+	Path   string
+	Reason string
+}
+
+func (e *DecodeError) Error() string { return e.Reason }
+
+// moveToErrorDir 将处理异常的文件移动到 target/error 目录
+func moveToErrorDir(path string, config Config, err error) {
+	errDir := filepath.Join(config.TargetDir, "error")
+	if err := os.MkdirAll(errDir, 0755); err != nil {
+		log.Printf("⚠️  创建 error 目录失败 %s: %v", errDir, err)
+		return
+	}
+
+	ext := filepath.Ext(path)
+	dst := filepath.Join(errDir, newUUID()+ext)
+	// 文件名冲突：追加序号
+	for i := 1; ; i++ {
+		if _, e := os.Stat(dst); os.IsNotExist(e) {
+			break
+		}
+		dst = filepath.Join(errDir, fmt.Sprintf("%s_(%d)%s", newUUID(), i, ext))
+	}
+
+	reason := "unknown"
+	switch err.(type) {
+	case *SizeFilterError:
+		reason = "size"
+	case *DecodeError:
+		reason = "decode"
+	}
+
+	if mErr := moveFile(path, dst); mErr != nil {
+		log.Printf("⚠️  移动文件到 error 目录失败 %s: %v", path, mErr)
+		return
+	}
+	fmt.Printf("   → error/%s: %s (%s)\n", reason, filepath.Base(dst), err.Error())
+}
+
+// analyzeImageFile 分析单个图片的黑暗/亮度程度（不做阈值过滤，返回完整信息）
 func analyzeImageFile(path string, config Config) (*WallpaperInfo, error) {
 	fileInfo, err := os.Stat(path)
 	if err != nil {
@@ -185,54 +290,53 @@ func analyzeImageFile(path string, config Config) (*WallpaperInfo, error) {
 
 	sizeKB := fileInfo.Size() / 1024
 	if sizeKB < config.MinSizeKB {
-		return nil, fmt.Errorf("文件太小: %dKB < %dKB", sizeKB, config.MinSizeKB)
+		return nil, &SizeFilterError{Path: path, Reason: fmt.Sprintf("文件太小: %dKB < %dKB", sizeKB, config.MinSizeKB)}
 	}
 
 	if fileInfo.Size() > config.MaxSizeMB*1024*1024 {
-		return nil, fmt.Errorf("文件太大: %dMB > %dMB", fileInfo.Size()/1024/1024, config.MaxSizeMB)
+		return nil, &SizeFilterError{Path: path, Reason: fmt.Sprintf("文件太大: %dMB > %dMB", fileInfo.Size()/1024/1024, config.MaxSizeMB)}
 	}
 
 	file, err := os.Open(path)
 	if err != nil {
-		return nil, err
+		return nil, &DecodeError{Path: path, Reason: err.Error()}
 	}
 	defer file.Close()
 
-	img, _, err := image.Decode(file)
+	img, imageName, err := image.Decode(file)
 	if err != nil {
-		return nil, err
+		return nil, &DecodeError{Path: path, Reason: err.Error()}
 	}
 
-	darkScore, avgColor, width, height := analyzeImage(img)
-
-	if width < config.MinWidth || height < config.MinHeight {
-		return nil, fmt.Errorf("分辨率不足: %dx%d < %dx%d", width, height, config.MinWidth, config.MinHeight)
-	}
+	darkScore, lightScore, avgColor, width, height := analyzeImage(img)
 
 	return &WallpaperInfo{
-		Path:      path,
-		DarkScore: darkScore,
-		AvgColor:  avgColor,
-		Size:      fileInfo.Size(),
-		Width:     width,
-		Height:    height,
+		Path:       path,
+		DarkScore:  darkScore,
+		LightScore: lightScore,
+		AvgColor:   avgColor,
+		Size:       fileInfo.Size(),
+		Width:      width,
+		Height:     height,
+		Ext:        detectExtension(path, imageName),
 	}, nil
 }
 
-// analyzeImage 分析图片的黑暗程度和尺寸
-// 使用暗色像素占比（亮度 < 80 的像素比例）作为评分，比平均亮度更能准确反映暗色背景壁纸
-func analyzeImage(img image.Image) (darkScore float64, avgColor color.RGBA, width, height int) {
+// analyzeImage 分析图片的黑暗程度、亮度程度和尺寸
+// darkScore: 暗色像素（亮度 < 80）占比；lightScore: 亮色像素（亮度 > 175）占比
+func analyzeImage(img image.Image) (darkScore float64, lightScore float64, avgColor color.RGBA, width, height int) {
 	bounds := img.Bounds()
 	width = bounds.Dx()
 	height = bounds.Dy()
 	totalPixels := width * height
 
 	if totalPixels == 0 {
-		return 0, color.RGBA{0, 0, 0, 255}, width, height
+		return 0, 0, color.RGBA{0, 0, 0, 255}, width, height
 	}
 
 	var sumR, sumG, sumB uint64
 	darkCount := 0
+	lightCount := 0
 	sampleCount := 0
 
 	// 大图采样以提高性能
@@ -251,28 +355,29 @@ func analyzeImage(img image.Image) (darkScore float64, avgColor color.RGBA, widt
 			sumG += uint64(g8)
 			sumB += uint64(b8)
 
-			// 亮度计算（ITU-R BT.601），判断是否为暗色像素
+			// 亮度计算（ITU-R BT.601）
 			brightness := 0.299*float64(r8) + 0.587*float64(g8) + 0.114*float64(b8)
 			if brightness < 80 {
 				darkCount++
+			} else if brightness > 175 {
+				lightCount++
 			}
 			sampleCount++
 		}
 	}
 
 	if sampleCount == 0 {
-		return 0, color.RGBA{0, 0, 0, 255}, width, height
+		return 0, 0, color.RGBA{0, 0, 0, 255}, width, height
 	}
 
-	// 暗色像素占比作为黑暗评分（0-1），比平均亮度更准确：
-	// 一张 80% 黑色背景 + 20% 明亮主体的壁纸，评分 0.80，正确反映"暗色背景"特性
 	darkScore = float64(darkCount) / float64(sampleCount)
+	lightScore = float64(lightCount) / float64(sampleCount)
 
 	avgR := uint8(sumR / uint64(sampleCount))
 	avgG := uint8(sumG / uint64(sampleCount))
 	avgB := uint8(sumB / uint64(sampleCount))
 
-	return darkScore, color.RGBA{avgR, avgG, avgB, 255}, width, height
+	return darkScore, lightScore, color.RGBA{avgR, avgG, avgB, 255}, width, height
 }
 
 // scanAllImages 一次性扫描所有图片并分析黑暗程度
@@ -299,8 +404,9 @@ func scanAllImages(config Config) ([]WallpaperInfo, error) {
 				wp, err := analyzeImageFile(path, config)
 				if err != nil {
 					if config.Verbose {
-						fmt.Printf("跳过 %s: %v\n", filepath.Base(path), err)
+						fmt.Printf("⚠️ 处理异常 %s: %v -> error/\n", filepath.Base(path), err)
 					}
+					moveToErrorDir(path, config, err)
 					continue
 				}
 				results <- wp
@@ -337,7 +443,8 @@ func scanAllImages(config Config) ([]WallpaperInfo, error) {
 			return nil
 		}
 		ext := strings.ToLower(filepath.Ext(path))
-		if supportedExts[ext] {
+		// 支持的后缀直接处理；无后缀文件按文件内容探测是否为图片（避免静默跳过）
+		if supportedExts[ext] || (ext == "" && isImageByContent(path)) {
 			processedCount++
 			jobs <- path
 		}
@@ -360,55 +467,140 @@ func scanAllImages(config Config) ([]WallpaperInfo, error) {
 	return allWallpapers, err
 }
 
-// filterByDarkness 根据黑暗阈值筛选图片
-func filterByDarkness(wallpapers []WallpaperInfo, minDarkScore float64) []WallpaperInfo {
-	var filtered []WallpaperInfo
-	for _, wp := range wallpapers {
-		if wp.DarkScore >= minDarkScore {
-			filtered = append(filtered, wp)
+// resolutionTierName 根据图片较长边返回分辨率档位名称（如 "1K"、"4K"、"8K")
+// 长边 < 1080 的过小图片单独归类为 "fixed"
+func resolutionTierName(width, height int) string {
+	longEdge := width
+	if height > longEdge {
+		longEdge = height
+	}
+	// 过小图片单独归类
+	if longEdge < 1080 {
+		return "fixed"
+	}
+	// 以标准横向分辨率作为各档位下限，取长边命中的最高档
+	tiers := []struct {
+		name string
+		edge int
+	}{
+		{"8K", 7680},
+		{"7K", 7168},
+		{"6K", 6144},
+		{"5K", 5120},
+		{"4K", 3840},
+		{"3K", 3072},
+		{"2K", 1920},
+		{"1K", 1080},
+	}
+	for _, t := range tiers {
+		if longEdge >= t.edge {
+			return t.name
 		}
 	}
-	return filtered
+	return "1K"
 }
 
-// cleanFileName 清理文件名中的特殊字符
-func cleanFileName(name string) string {
-	replacements := map[string]string{
-		" ": "_", "/": "_", "\\": "_", ":": "_",
-		"*": "", "?": "", "\"": "", "<": "", ">": "", "|": "",
+// newUUID 通过 crypto/rand 生成的 32 位十六进制随机文件名（不含扩展名）
+func newUUID() string {
+	const hexChars = "0123456789abcdef"
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		// 极难发生；回退到时间戳保证唯一
+		return fmt.Sprintf("%x", time.Now().UnixNano())
 	}
-	result := name
-	for old, n := range replacements {
-		result = strings.ReplaceAll(result, old, n)
+	for i, b := range buf {
+		buf[i] = hexChars[b&0x0f]
 	}
-	// 按 rune 截断，避免截断多字节 UTF-8 字符
-	runes := []rune(result)
-	if len(runes) > 100 {
-		result = string(runes[:100])
-	}
-	return result
+	return string(buf)
 }
 
-// moveOrCopyFile 移动或复制文件到目标目录
-func moveOrCopyFile(wp *WallpaperInfo, targetDir string, copyMode bool) error {
-	if err := os.MkdirAll(targetDir, 0755); err != nil {
+// isPSDOrGIF 判断扩展名是否为 PSD/PSB/GIF（单独归置，不参与明暗分类）
+func isPSDOrGIF(path string) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".psd", ".psb", ".gif":
+		return true
+	}
+	return false
+}
+
+// psdGifDirName 返回 PSD/GIF 对应的独立目录名（gif 用 gif，PSD/PSB 用 psd）
+func psdGifDirName(path string) string {
+	if strings.ToLower(filepath.Ext(path)) == ".gif" {
+		return "gif"
+	}
+	return "psd"
+}
+
+// formatExtensions 格式名到扩展名的映射（image.Image.Decode 返回的格式名）
+var formatExtensions = map[string]string{
+	"png":  ".png",
+	"jpeg": ".jpg",
+	"gif":  ".gif",
+	"bmp":  ".bmp",
+	"tiff": ".tiff",
+	"webp": ".webp",
+	"psd":  ".psd",
+	"psb":  ".psb",
+}
+
+// detectExtension 决定归档用扩展名：优先保留原后缀（如 .jfif），无后缀时按解码出的格式名补一个
+func detectExtension(path, imageName string) string {
+	if ext := strings.ToLower(filepath.Ext(path)); ext != "" {
+		return ext
+	}
+	if ext, ok := formatExtensions[imageName]; ok {
+		return ext
+	}
+	return ""
+}
+
+// isImageByContent 通过读取文件头（magic 字节）判断是否为已注册的图片格式，用于无后缀文件
+func isImageByContent(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	_, _, err = image.DecodeConfig(f)
+	return err == nil
+}
+
+// directionName 返回图像的横竖方向（宽==高为 square，宽>高为 horizontal，否则 vertical）
+func directionName(width, height int) string {
+	if width == height {
+		return "square"
+	}
+	if width > height {
+		return "horizontal"
+	}
+	return "vertical"
+}
+
+// moveOrCopyFile 移动或复制文件到目标目录（direction 与 tier 为子目录，可为空）
+func moveOrCopyFile(wp *WallpaperInfo, targetDir, direction, tier string, copyMode bool) error {
+	dir := targetDir
+	if direction != "" {
+		dir = filepath.Join(dir, direction)
+	}
+	if tier != "" {
+		dir = filepath.Join(dir, tier)
+	}
+	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
 
-	ext := filepath.Ext(wp.Path)
-	baseName := strings.TrimSuffix(filepath.Base(wp.Path), ext)
-	cleanName := cleanFileName(baseName)
-
-	newFilename := fmt.Sprintf("%s_[%dx%d]_dark%.0f%s",
-		cleanName, wp.Width, wp.Height, wp.DarkScore*100, ext)
-	dstPath := filepath.Join(targetDir, newFilename)
+	ext := wp.Ext
+	if ext == "" {
+		ext = filepath.Ext(wp.Path)
+	}
+	newFilename := newUUID() + ext
+	dstPath := filepath.Join(dir, newFilename)
 
 	// 文件名冲突：追加序号
 	if _, err := os.Stat(dstPath); err == nil {
 		for i := 1; i < 100; i++ {
-			newFilename = fmt.Sprintf("%s_[%dx%d]_dark%.0f_(%d)%s",
-				cleanName, wp.Width, wp.Height, wp.DarkScore*100, i, ext)
-			dstPath = filepath.Join(targetDir, newFilename)
+			newFilename = fmt.Sprintf("%s_(%d)%s", newUUID(), i, ext)
+			dstPath = filepath.Join(dir, newFilename)
 			if _, err := os.Stat(dstPath); os.IsNotExist(err) {
 				break
 			}
@@ -448,22 +640,4 @@ func moveFile(src, dst string) error {
 		return err
 	}
 	return os.Remove(src)
-}
-
-// moveWallpapers 将图片列表移动到指定目标目录
-func moveWallpapers(wallpapers []WallpaperInfo, targetDir string, copyMode bool) (int, error) {
-	movedCount := 0
-	var firstErr error
-
-	for _, wp := range wallpapers {
-		if err := moveOrCopyFile(&wp, targetDir, copyMode); err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
-			continue
-		}
-		movedCount++
-	}
-
-	return movedCount, firstErr
 }
